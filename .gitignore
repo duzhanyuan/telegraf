@@ -1,4 +1,6 @@
-pkg/
 tivan
 .vagrant
-telegraf
+/telegraf
+.idea
+*~
+*#

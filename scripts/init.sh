@@ -1,5 +1,8 @@
 #! /usr/bin/env bash
 
+# chkconfig: 2345 99 01
+# description: Telegraf daemon
+
 ### BEGIN INIT INFO
 # Provides:          telegraf
 # Required-Start:    $all
@@ -48,7 +51,6 @@ if [ ! -f "$STDERR" ]; then
     mkdir -p `dirname $STDERR`
 fi
 
-
 OPEN_FILE_LIMIT=65536
 
 function pidofproc() {
@@ -56,14 +58,17 @@ function pidofproc() {
         echo "Expected three arguments, e.g. $0 -p pidfile daemon-name"
     fi
 
-    pid=`pgrep -f $3`
+    if [ ! -f "$2" ]; then
+        return 1
+    fi
+
     local pidfile=`cat $2`
 
     if [ "x$pidfile" == "x" ]; then
         return 1
     fi
 
-    if [ "x$pid" != "x" -a "$pidfile" == "$pid" ]; then
+    if ps --pid "$pidfile" | grep -q $(basename $3); then
         return 0
     fi
 
@@ -92,7 +97,7 @@ function log_success_msg() {
 name=telegraf
 
 # Daemon name, where is the actual executable
-daemon=/opt/telegraf/telegraf
+daemon=/usr/bin/telegraf
 
 # pid file for the daemon
 pidfile=/var/run/telegraf/telegraf.pid
@@ -100,11 +105,12 @@ piddir=`dirname $pidfile`
 
 if [ ! -d "$piddir" ]; then
     mkdir -p $piddir
-    chown $GROUP:$USER $piddir
+    chown $USER:$GROUP $piddir
 fi
 
 # Configuration file
-config=/etc/opt/telegraf/telegraf.conf
+config=/etc/telegraf/telegraf.conf
+confdir=/etc/telegraf/telegraf.d
 
 # If the daemon is not there, then exit.
 [ -x $daemon ] || exit 5
@@ -130,9 +136,9 @@ case $1 in
 
         log_success_msg "Starting the process" "$name"
         if which start-stop-daemon > /dev/null 2>&1; then
-            start-stop-daemon --chuid $GROUP:$USER --start --quiet --pidfile $pidfile --exec $daemon -- -pidfile $pidfile -config $config $TELEGRAF_OPTS >>$STDOUT 2>>$STDERR &
+            start-stop-daemon --chuid $USER:$GROUP --start --quiet --pidfile $pidfile --exec $daemon -- -pidfile $pidfile -config $config -config-directory $confdir $TELEGRAF_OPTS >>$STDOUT 2>>$STDERR &
         else
-            nohup $daemon -pidfile $pidfile -config $config $TELEGRAF_OPTS >>$STDOUT 2>>$STDERR &
+            su -s /bin/sh -c "nohup $daemon -pidfile $pidfile -config $config -config-directory $confdir $TELEGRAF_OPTS >>$STDOUT 2>>$STDERR &" $USER
         fi
         log_success_msg "$name process was started"
         ;;
@@ -146,6 +152,22 @@ case $1 in
                     log_success_msg "$name process was stopped"
                 else
                     log_failure_msg "$name failed to stop service"
+                fi
+            fi
+        else
+            log_failure_msg "$name process is not running"
+        fi
+        ;;
+
+    reload)
+        # Reload the daemon.
+        if [ -e $pidfile ]; then
+            pidofproc -p $pidfile $daemon > /dev/null 2>&1 && status="0" || status="$?"
+            if [ "$status" = 0 ]; then
+                if killproc -p $pidfile SIGHUP; then
+                    log_success_msg "$name process was reloaded"
+                else
+                    log_failure_msg "$name failed to reload service"
                 fi
             fi
         else

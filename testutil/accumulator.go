@@ -1,60 +1,102 @@
 package testutil
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
+	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
-// Point defines a single point measurement
-type Point struct {
+// Metric defines a single point measurement
+type Metric struct {
 	Measurement string
 	Tags        map[string]string
-	Values      map[string]interface{}
+	Fields      map[string]interface{}
 	Time        time.Time
+}
+
+func (p *Metric) String() string {
+	return fmt.Sprintf("%s %v", p.Measurement, p.Fields)
 }
 
 // Accumulator defines a mocked out accumulator
 type Accumulator struct {
-	Points []*Point
+	sync.Mutex
+
+	Metrics []*Metric
+	debug   bool
 }
 
 // Add adds a measurement point to the accumulator
-func (a *Accumulator) Add(measurement string, value interface{}, tags map[string]string) {
+func (a *Accumulator) Add(
+	measurement string,
+	value interface{},
+	tags map[string]string,
+	t ...time.Time,
+) {
+	fields := map[string]interface{}{"value": value}
+	a.AddFields(measurement, fields, tags, t...)
+}
+
+// AddFields adds a measurement point with a specified timestamp.
+func (a *Accumulator) AddFields(
+	measurement string,
+	fields map[string]interface{},
+	tags map[string]string,
+	timestamp ...time.Time,
+) {
+	a.Lock()
+	defer a.Unlock()
 	if tags == nil {
 		tags = map[string]string{}
 	}
-	a.Points = append(
-		a.Points,
-		&Point{
-			Measurement: measurement,
-			Values:      map[string]interface{}{"value": value},
-			Tags:        tags,
-		},
-	)
+
+	if len(fields) == 0 {
+		return
+	}
+
+	var t time.Time
+	if len(timestamp) > 0 {
+		t = timestamp[0]
+	} else {
+		t = time.Now()
+	}
+
+	if a.debug {
+		pretty, _ := json.MarshalIndent(fields, "", "  ")
+		prettyTags, _ := json.MarshalIndent(tags, "", "  ")
+		msg := fmt.Sprintf("Adding Measurement [%s]\nFields:%s\nTags:%s\n",
+			measurement, string(pretty), string(prettyTags))
+		fmt.Print(msg)
+	}
+
+	p := &Metric{
+		Measurement: measurement,
+		Fields:      fields,
+		Tags:        tags,
+		Time:        t,
+	}
+
+	a.Metrics = append(a.Metrics, p)
 }
 
-// AddValuesWithTime adds a measurement point with a specified timestamp.
-func (a *Accumulator) AddValuesWithTime(
-	measurement string,
-	values map[string]interface{},
-	tags map[string]string,
-	timestamp time.Time,
-) {
-	a.Points = append(
-		a.Points,
-		&Point{
-			Measurement: measurement,
-			Values:      values,
-			Tags:        tags,
-			Time:        timestamp,
-		},
-	)
+func (a *Accumulator) Debug() bool {
+	// stub for implementing Accumulator interface.
+	return a.debug
+}
+
+func (a *Accumulator) SetDebug(debug bool) {
+	// stub for implementing Accumulator interface.
+	a.debug = debug
 }
 
 // Get gets the specified measurement point from the accumulator
-func (a *Accumulator) Get(measurement string) (*Point, bool) {
-	for _, p := range a.Points {
+func (a *Accumulator) Get(measurement string) (*Metric, bool) {
+	for _, p := range a.Metrics {
 		if p.Measurement == measurement {
 			return p, true
 		}
@@ -63,65 +105,71 @@ func (a *Accumulator) Get(measurement string) (*Point, bool) {
 	return nil, false
 }
 
-// CheckValue checks that the accumulators point for the given measurement
-// is the same as the given value.
-func (a *Accumulator) CheckValue(measurement string, val interface{}) bool {
-	for _, p := range a.Points {
-		if p.Measurement == measurement {
-			return p.Values["value"] == val
+// NFields returns the total number of fields in the accumulator, across all
+// measurements
+func (a *Accumulator) NFields() int {
+	a.Lock()
+	defer a.Unlock()
+	counter := 0
+	for _, pt := range a.Metrics {
+		for _, _ = range pt.Fields {
+			counter++
 		}
 	}
-
-	return false
+	return counter
 }
 
-// CheckTaggedValue calls ValidateTaggedValue
-func (a *Accumulator) CheckTaggedValue(
+func (a *Accumulator) AssertContainsTaggedFields(
+	t *testing.T,
 	measurement string,
-	val interface{},
+	fields map[string]interface{},
 	tags map[string]string,
-) bool {
-	return a.ValidateTaggedValue(measurement, val, tags) == nil
-}
-
-// ValidateTaggedValue validates that the given measurement and value exist
-// in the accumulator and with the given tags.
-func (a *Accumulator) ValidateTaggedValue(
-	measurement string,
-	val interface{},
-	tags map[string]string,
-) error {
-	if tags == nil {
-		tags = map[string]string{}
-	}
-	for _, p := range a.Points {
+) {
+	a.Lock()
+	defer a.Unlock()
+	for _, p := range a.Metrics {
 		if !reflect.DeepEqual(tags, p.Tags) {
 			continue
 		}
 
 		if p.Measurement == measurement {
-			if p.Values["value"] != val {
-				return fmt.Errorf("%v (%T) != %v (%T)",
-					p.Values["value"], p.Values["value"], val, val)
-			}
-			return nil
+			assert.Equal(t, fields, p.Fields)
+			return
 		}
 	}
-
-	return fmt.Errorf("unknown measurement %s with tags %v", measurement, tags)
+	msg := fmt.Sprintf("unknown measurement %s with tags %v", measurement, tags)
+	assert.Fail(t, msg)
 }
 
-// ValidateValue calls ValidateTaggedValue
-func (a *Accumulator) ValidateValue(measurement string, val interface{}) error {
-	return a.ValidateTaggedValue(measurement, val, nil)
+func (a *Accumulator) AssertContainsFields(
+	t *testing.T,
+	measurement string,
+	fields map[string]interface{},
+) {
+	a.Lock()
+	defer a.Unlock()
+	for _, p := range a.Metrics {
+		if p.Measurement == measurement {
+			assert.Equal(t, fields, p.Fields)
+			return
+		}
+	}
+	msg := fmt.Sprintf("unknown measurement %s", measurement)
+	assert.Fail(t, msg)
 }
 
 // HasIntValue returns true if the measurement has an Int value
-func (a *Accumulator) HasIntValue(measurement string) bool {
-	for _, p := range a.Points {
+func (a *Accumulator) HasIntField(measurement string, field string) bool {
+	a.Lock()
+	defer a.Unlock()
+	for _, p := range a.Metrics {
 		if p.Measurement == measurement {
-			_, ok := p.Values["value"].(int64)
-			return ok
+			for fieldname, value := range p.Fields {
+				if fieldname == field {
+					_, ok := value.(int64)
+					return ok
+				}
+			}
 		}
 	}
 
@@ -129,11 +177,17 @@ func (a *Accumulator) HasIntValue(measurement string) bool {
 }
 
 // HasUIntValue returns true if the measurement has a UInt value
-func (a *Accumulator) HasUIntValue(measurement string) bool {
-	for _, p := range a.Points {
+func (a *Accumulator) HasUIntField(measurement string, field string) bool {
+	a.Lock()
+	defer a.Unlock()
+	for _, p := range a.Metrics {
 		if p.Measurement == measurement {
-			_, ok := p.Values["value"].(uint64)
-			return ok
+			for fieldname, value := range p.Fields {
+				if fieldname == field {
+					_, ok := value.(uint64)
+					return ok
+				}
+			}
 		}
 	}
 
@@ -141,13 +195,32 @@ func (a *Accumulator) HasUIntValue(measurement string) bool {
 }
 
 // HasFloatValue returns true if the given measurement has a float value
-func (a *Accumulator) HasFloatValue(measurement string) bool {
-	for _, p := range a.Points {
+func (a *Accumulator) HasFloatField(measurement string, field string) bool {
+	a.Lock()
+	defer a.Unlock()
+	for _, p := range a.Metrics {
 		if p.Measurement == measurement {
-			_, ok := p.Values["value"].(float64)
-			return ok
+			for fieldname, value := range p.Fields {
+				if fieldname == field {
+					_, ok := value.(float64)
+					return ok
+				}
+			}
 		}
 	}
 
+	return false
+}
+
+// HasMeasurement returns true if the accumulator has a measurement with the
+// given name
+func (a *Accumulator) HasMeasurement(measurement string) bool {
+	a.Lock()
+	defer a.Unlock()
+	for _, p := range a.Metrics {
+		if p.Measurement == measurement {
+			return true
+		}
+	}
 	return false
 }
