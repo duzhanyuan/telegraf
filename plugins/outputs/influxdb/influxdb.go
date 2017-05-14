@@ -1,21 +1,22 @@
 package influxdb
 
 import (
-	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
-	"net/url"
 	"strings"
 	"time"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
+	"github.com/influxdata/telegraf/metric"
 	"github.com/influxdata/telegraf/plugins/outputs"
 
-	"github.com/influxdata/influxdb/client/v2"
+	"github.com/influxdata/telegraf/plugins/outputs/influxdb/client"
 )
 
+// InfluxDB struct is the primary data structure for the plugin
 type InfluxDB struct {
 	// URL is only for backwards compatability
 	URL              string
@@ -24,7 +25,6 @@ type InfluxDB struct {
 	Password         string
 	Database         string
 	UserAgent        string
-	Precision        string
 	RetentionPolicy  string
 	WriteConsistency string
 	Timeout          internal.Duration
@@ -39,24 +39,29 @@ type InfluxDB struct {
 	// Use SSL but skip chain & host verification
 	InsecureSkipVerify bool
 
-	conns []client.Client
+	// Precision is only here for legacy support. It will be ignored.
+	Precision string
+
+	clients      []client.Client
+	splitPayload bool
 }
 
 var sampleConfig = `
-  ## The full HTTP or UDP endpoint URL for your InfluxDB instance.
+  ## The HTTP or UDP URL for your InfluxDB instance.  Each item should be
+  ## of the form:
+  ##   scheme "://" host [ ":" port]
+  ##
   ## Multiple urls can be specified as part of the same cluster,
   ## this means that only ONE of the urls will be written to each interval.
   # urls = ["udp://localhost:8089"] # UDP endpoint example
   urls = ["http://localhost:8086"] # required
   ## The target database for metrics (telegraf will create it if not exists).
   database = "telegraf" # required
-  ## Precision of writes, valid values are "ns", "us" (or "µs"), "ms", "s", "m", "h".
-  ## note: using "s" precision greatly improves InfluxDB compression.
-  precision = "s"
 
-  ## Retention policy to write to.
-  retention_policy = "default"
-  ## Write consistency (clusters only), can be: "any", "one", "quorom", "all"
+  ## Name of existing retention policy to write to.  Empty string writes to
+  ## the default retention policy.
+  retention_policy = ""
+  ## Write consistency (clusters only), can be: "any", "one", "quorum", "all"
   write_consistency = "any"
 
   ## Write timeout (for the InfluxDB client), formatted as a string.
@@ -77,11 +82,10 @@ var sampleConfig = `
   # insecure_skip_verify = false
 `
 
+// Connect initiates the primary connection to the range of provided URLs
 func (i *InfluxDB) Connect() error {
 	var urls []string
-	for _, u := range i.URLs {
-		urls = append(urls, u)
-	}
+	urls = append(urls, i.URLs...)
 
 	// Backward-compatability with single Influx URL config files
 	// This could eventually be removed in favor of specifying the urls as a list
@@ -89,128 +93,118 @@ func (i *InfluxDB) Connect() error {
 		urls = append(urls, i.URL)
 	}
 
-	tlsCfg, err := internal.GetTLSConfig(
+	tlsConfig, err := internal.GetTLSConfig(
 		i.SSLCert, i.SSLKey, i.SSLCA, i.InsecureSkipVerify)
 	if err != nil {
 		return err
 	}
 
-	var conns []client.Client
 	for _, u := range urls {
 		switch {
 		case strings.HasPrefix(u, "udp"):
-			parsed_url, err := url.Parse(u)
-			if err != nil {
-				return err
-			}
-
-			if i.UDPPayload == 0 {
-				i.UDPPayload = client.UDPPayloadSize
-			}
-			c, err := client.NewUDPClient(client.UDPConfig{
-				Addr:        parsed_url.Host,
+			config := client.UDPConfig{
+				URL:         u,
 				PayloadSize: i.UDPPayload,
-			})
-			if err != nil {
-				return err
 			}
-			conns = append(conns, c)
+			c, err := client.NewUDP(config)
+			if err != nil {
+				return fmt.Errorf("Error creating UDP Client [%s]: %s", u, err)
+			}
+			i.clients = append(i.clients, c)
+			i.splitPayload = true
 		default:
 			// If URL doesn't start with "udp", assume HTTP client
-			c, err := client.NewHTTPClient(client.HTTPConfig{
-				Addr:      u,
+			config := client.HTTPConfig{
+				URL:       u,
+				Timeout:   i.Timeout.Duration,
+				TLSConfig: tlsConfig,
+				UserAgent: i.UserAgent,
 				Username:  i.Username,
 				Password:  i.Password,
-				UserAgent: i.UserAgent,
-				Timeout:   i.Timeout.Duration,
-				TLSConfig: tlsCfg,
-			})
-			if err != nil {
-				return err
 			}
-
-			err = createDatabase(c, i.Database)
+			wp := client.WriteParams{
+				Database:        i.Database,
+				RetentionPolicy: i.RetentionPolicy,
+				Consistency:     i.WriteConsistency,
+			}
+			c, err := client.NewHTTP(config, wp)
 			if err != nil {
-				log.Println("Database creation failed: " + err.Error())
+				return fmt.Errorf("Error creating HTTP Client [%s]: %s", u, err)
+			}
+			i.clients = append(i.clients, c)
+
+			err = c.Query("CREATE DATABASE " + i.Database)
+			if err != nil {
+				if !strings.Contains(err.Error(), "Status Code [403]") {
+					log.Println("I! Database creation failed: " + err.Error())
+				}
 				continue
 			}
-
-			conns = append(conns, c)
 		}
 	}
 
-	i.conns = conns
 	rand.Seed(time.Now().UnixNano())
 	return nil
 }
 
-func createDatabase(c client.Client, database string) error {
-	// Create Database if it doesn't exist
-	_, err := c.Query(client.Query{
-		Command: fmt.Sprintf("CREATE DATABASE IF NOT EXISTS \"%s\"", database),
-	})
-	return err
-}
-
+// Close will terminate the session to the backend, returning error if an issue arises
 func (i *InfluxDB) Close() error {
-	var errS string
-	for j, _ := range i.conns {
-		if err := i.conns[j].Close(); err != nil {
-			errS += err.Error()
-		}
-	}
-	if errS != "" {
-		return fmt.Errorf("output influxdb close failed: %s", errS)
-	}
 	return nil
 }
 
+// SampleConfig returns the formatted sample configuration for the plugin
 func (i *InfluxDB) SampleConfig() string {
 	return sampleConfig
 }
 
+// Description returns the human-readable function definition of the plugin
 func (i *InfluxDB) Description() string {
 	return "Configuration for influxdb server to send metrics to"
 }
 
-// Choose a random server in the cluster to write to until a successful write
+func (i *InfluxDB) getReader(metrics []telegraf.Metric) io.Reader {
+	if !i.splitPayload {
+		return metric.NewReader(metrics)
+	}
+
+	splitData := make([]telegraf.Metric, 0)
+	for _, m := range metrics {
+		splitData = append(splitData, m.Split(i.UDPPayload)...)
+	}
+	return metric.NewReader(splitData)
+}
+
+// Write will choose a random server in the cluster to write to until a successful write
 // occurs, logging each unsuccessful. If all servers fail, return error.
 func (i *InfluxDB) Write(metrics []telegraf.Metric) error {
-	if len(i.conns) == 0 {
-		err := i.Connect()
-		if err != nil {
-			return err
-		}
+	bufsize := 0
+	for _, m := range metrics {
+		bufsize += m.Len()
 	}
-	bp, err := client.NewBatchPoints(client.BatchPointsConfig{
-		Database:         i.Database,
-		Precision:        i.Precision,
-		RetentionPolicy:  i.RetentionPolicy,
-		WriteConsistency: i.WriteConsistency,
-	})
-	if err != nil {
-		return err
-	}
-
-	for _, metric := range metrics {
-		bp.AddPoint(metric.Point())
-	}
+	r := i.getReader(metrics)
 
 	// This will get set to nil if a successful write occurs
-	err = errors.New("Could not write to any InfluxDB server in cluster")
+	err := fmt.Errorf("Could not write to any InfluxDB server in cluster")
 
-	p := rand.Perm(len(i.conns))
+	p := rand.Perm(len(i.clients))
 	for _, n := range p {
-		if e := i.conns[n].Write(bp); e != nil {
-			// Log write failure
-			log.Printf("ERROR: %s", e)
-			// If the database was not found, try to recreate it
+		if _, e := i.clients[n].WriteStream(r, bufsize); e != nil {
+			// If the database was not found, try to recreate it:
 			if strings.Contains(e.Error(), "database not found") {
-				if errc := createDatabase(i.conns[n], i.Database); errc != nil {
-					log.Printf("ERROR: Database %s not found and failed to recreate\n",
+				if errc := i.clients[n].Query("CREATE DATABASE  " + i.Database); errc != nil {
+					log.Printf("E! Error: Database %s not found and failed to recreate\n",
 						i.Database)
 				}
 			}
+			if strings.Contains(e.Error(), "field type conflict") {
+				log.Printf("E! Field type conflict, dropping conflicted points: %s", e)
+				// setting err to nil, otherwise we will keep retrying and points
+				// w/ conflicting types will get stuck in the buffer forever.
+				err = nil
+				break
+			}
+			// Log write failure
+			log.Printf("E! InfluxDB Output Error: %s", e)
 		} else {
 			err = nil
 			break
@@ -220,10 +214,12 @@ func (i *InfluxDB) Write(metrics []telegraf.Metric) error {
 	return err
 }
 
+func newInflux() *InfluxDB {
+	return &InfluxDB{
+		Timeout: internal.Duration{Duration: time.Second * 5},
+	}
+}
+
 func init() {
-	outputs.Add("influxdb", func() telegraf.Output {
-		return &InfluxDB{
-			Timeout: internal.Duration{Duration: time.Second * 5},
-		}
-	})
+	outputs.Add("influxdb", func() telegraf.Output { return newInflux() })
 }

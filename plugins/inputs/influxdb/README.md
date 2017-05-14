@@ -15,9 +15,20 @@ InfluxDB-formatted endpoints. See below for more information.
   ## See the influxdb plugin's README for more details.
 
   ## Multiple URLs from which to read InfluxDB-formatted JSON
+  ## Default is "http://localhost:8086/debug/vars".
   urls = [
     "http://localhost:8086/debug/vars"
   ]
+
+  ## Optional SSL Config
+  # ssl_ca = "/etc/telegraf/ca.pem"
+  # ssl_cert = "/etc/telegraf/cert.pem"
+  # ssl_key = "/etc/telegraf/key.pem"
+  ## Use SSL but skip chain & host verification
+  # insecure_skip_verify = false
+
+  ## http request & header timeout
+  timeout = "5s"
 ```
 
 ### Measurements & Fields
@@ -63,7 +74,7 @@ InfluxDB-formatted endpoints. See below for more information.
 ### Example Output:
 
 ```
-telegraf -config ~/ws/telegraf.conf -input-filter influxdb -test
+telegraf --config ~/ws/telegraf.conf --input-filter influxdb --test
 * Plugin: influxdb, Collection 1
 > influxdb_database,database=_internal,host=tyrion,url=http://localhost:8086/debug/vars numMeasurements=10,numSeries=29 1463590500247354636
 > influxdb_httpd,bind=:8086,host=tyrion,url=http://localhost:8086/debug/vars req=7,reqActive=1,reqDurationNs=14227734 1463590500247354636

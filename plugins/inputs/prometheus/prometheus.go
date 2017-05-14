@@ -1,35 +1,56 @@
 package prometheus
 
 import (
-	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/plugins/inputs"
 	"io/ioutil"
-	"net"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/internal"
+	"github.com/influxdata/telegraf/plugins/inputs"
 )
+
+const acceptHeader = `application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3`
 
 type Prometheus struct {
 	Urls []string
 
-	// Use SSL but skip chain & host verification
-	InsecureSkipVerify bool
 	// Bearer Token authorization file path
 	BearerToken string `toml:"bearer_token"`
+
+	ResponseTimeout internal.Duration `toml:"response_timeout"`
+
+	// Path to CA file
+	SSLCA string `toml:"ssl_ca"`
+	// Path to host cert file
+	SSLCert string `toml:"ssl_cert"`
+	// Path to cert key file
+	SSLKey string `toml:"ssl_key"`
+	// Use SSL but skip chain & host verification
+	InsecureSkipVerify bool
+
+	client *http.Client
 }
 
 var sampleConfig = `
   ## An array of urls to scrape metrics from.
   urls = ["http://localhost:9100/metrics"]
 
-  ## Use SSL but skip chain & host verification
-  # insecure_skip_verify = false
   ## Use bearer token for authorization
   # bearer_token = /path/to/bearer/token
+
+  ## Specify timeout duration for slower prometheus clients (default is 3s)
+  # response_timeout = "3s"
+
+  ## Optional SSL Config
+  # ssl_ca = /path/to/cafile
+  # ssl_cert = /path/to/certfile
+  # ssl_key = /path/to/keyfile
+  ## Use SSL but skip chain & host verification
+  # insecure_skip_verify = false
 `
 
 func (p *Prometheus) SampleConfig() string {
@@ -45,21 +66,27 @@ var ErrProtocolError = errors.New("prometheus protocol error")
 // Reads stats from all configured servers accumulates stats.
 // Returns one of the errors encountered while gather stats (if any).
 func (p *Prometheus) Gather(acc telegraf.Accumulator) error {
-	var wg sync.WaitGroup
+	if p.client == nil {
+		client, err := p.createHttpClient()
+		if err != nil {
+			return err
+		}
+		p.client = client
+	}
 
-	var outerr error
+	var wg sync.WaitGroup
 
 	for _, serv := range p.Urls {
 		wg.Add(1)
 		go func(serv string) {
 			defer wg.Done()
-			outerr = p.gatherURL(serv, acc)
+			acc.AddError(p.gatherURL(serv, acc))
 		}(serv)
 	}
 
 	wg.Wait()
 
-	return outerr
+	return nil
 }
 
 var tr = &http.Transport{
@@ -71,24 +98,29 @@ var client = &http.Client{
 	Timeout:   time.Duration(4 * time.Second),
 }
 
+func (p *Prometheus) createHttpClient() (*http.Client, error) {
+	tlsCfg, err := internal.GetTLSConfig(
+		p.SSLCert, p.SSLKey, p.SSLCA, p.InsecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig:   tlsCfg,
+			DisableKeepAlives: true,
+		},
+		Timeout: p.ResponseTimeout.Duration,
+	}
+
+	return client, nil
+}
+
 func (p *Prometheus) gatherURL(url string, acc telegraf.Accumulator) error {
-	collectDate := time.Now()
 	var req, err = http.NewRequest("GET", url, nil)
-	req.Header = make(http.Header)
+	req.Header.Add("Accept", acceptHeader)
 	var token []byte
 	var resp *http.Response
-
-	var rt http.RoundTripper = &http.Transport{
-		Dial: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).Dial,
-		TLSHandshakeTimeout: 5 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: p.InsecureSkipVerify,
-		},
-		ResponseHeaderTimeout: time.Duration(3 * time.Second),
-	}
 
 	if p.BearerToken != "" {
 		token, err = ioutil.ReadFile(p.BearerToken)
@@ -98,7 +130,7 @@ func (p *Prometheus) gatherURL(url string, acc telegraf.Accumulator) error {
 		req.Header.Set("Authorization", "Bearer "+string(token))
 	}
 
-	resp, err = rt.RoundTrip(req)
+	resp, err = p.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("error making HTTP request to %s: %s", url, err)
 	}
@@ -112,27 +144,16 @@ func (p *Prometheus) gatherURL(url string, acc telegraf.Accumulator) error {
 		return fmt.Errorf("error reading body: %s", err)
 	}
 
-	// Headers
-	headers := make(map[string]string)
-	for key, value := range headers {
-		headers[key] = value
-	}
-
-	// Prepare Prometheus parser config
-	promparser := PrometheusParser{
-		PromFormat: headers,
-	}
-
-	metrics, err := promparser.Parse(body)
+	metrics, err := Parse(body, resp.Header)
 	if err != nil {
-		return fmt.Errorf("error getting processing samples for %s: %s",
+		return fmt.Errorf("error reading metrics for %s: %s",
 			url, err)
 	}
 	// Add (or not) collected metrics
 	for _, metric := range metrics {
 		tags := metric.Tags()
 		tags["url"] = url
-		acc.AddFields(metric.Name(), metric.Fields(), tags, collectDate)
+		acc.AddFields(metric.Name(), metric.Fields(), tags, metric.Time())
 	}
 
 	return nil
@@ -140,6 +161,6 @@ func (p *Prometheus) gatherURL(url string, acc telegraf.Accumulator) error {
 
 func init() {
 	inputs.Add("prometheus", func() telegraf.Input {
-		return &Prometheus{}
+		return &Prometheus{ResponseTimeout: internal.Duration{Duration: time.Second * 3}}
 	})
 }

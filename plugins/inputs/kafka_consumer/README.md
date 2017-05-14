@@ -15,28 +15,25 @@ from the same topic in parallel.
   topics = ["telegraf"]
   ## an array of Zookeeper connection strings
   zookeeper_peers = ["localhost:2181"]
+  ## Zookeeper Chroot
+  zookeeper_chroot = ""
   ## the name of the consumer group
   consumer_group = "telegraf_metrics_consumers"
-  ## Maximum number of metrics to buffer between collection intervals
-  metric_buffer = 100000
   ## Offset (must be either "oldest" or "newest")
   offset = "oldest"
 
-  ## Data format to consume. 
-
-  ## Each data format has it's own unique set of configuration options, read
+  ## Data format to consume.
+  ## Each data format has its own unique set of configuration options, read
   ## more about them here:
   ## https://github.com/influxdata/telegraf/blob/master/docs/DATA_FORMATS_INPUT.md
   data_format = "influx"
+
+  ## Maximum length of a message to consume, in bytes (default 0/unlimited);
+  ## larger messages are dropped
+  max_message_len = 65536
 ```
 
 ## Testing
 
-Running integration tests requires running Zookeeper & Kafka. The following
-commands assume you're on OS X & using [boot2docker](http://boot2docker.io/) or docker-machine through [Docker Toolbox](https://www.docker.com/docker-toolbox).
-
-To start Kafka & Zookeeper:
-
-```
-docker run -d -p 2181:2181 -p 9092:9092 --env ADVERTISED_HOST=`boot2docker ip || docker-machine ip <your_machine_name>` --env ADVERTISED_PORT=9092 spotify/kafka
-```
+Running integration tests requires running Zookeeper & Kafka. See Makefile
+for kafka container command.

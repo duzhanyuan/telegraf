@@ -13,6 +13,17 @@ Example for Kubernetes apiserver
   urls = ["http://my-kube-apiserver:8080/metrics"]
 ```
 
+Specify a 10 second timeout for slower/over-loaded clients
+```toml
+# Get all metrics from Kube-apiserver
+[[inputs.prometheus]]
+  # An array of urls to scrape metrics from.
+  urls = ["http://my-kube-apiserver:8080/metrics"]
+
+  # Specify timeout duration for slower prometheus clients (default is 3s)
+  response_timeout = "10s"
+```
+
 You can use more complex configuration
 to filter and some tags
 
@@ -28,6 +39,26 @@ to filter and some tags
   # Add tags to be able to make beautiful dashboards
   [inputs.prometheus.tags]
     kubeservice = "kube-apiserver"
+```
+
+```toml
+# Authorize with a bearer token skipping cert verification
+[[inputs.prometheus]]
+  # An array of urls to scrape metrics from.
+  urls = ["http://my-kube-apiserver:8080/metrics"]
+  bearer_token = '/path/to/bearer/token'
+  insecure_skip_verify = true
+```
+
+```toml
+# Authorize using x509 certs
+[[inputs.prometheus]]
+  # An array of urls to scrape metrics from.
+  urls = ["https://my-kube-apiserver:8080/metrics"]
+
+  ssl_ca = '/path/to/cafile'
+  ssl_cert = '/path/to/certfile'
+  ssl_key = '/path/to/keyfile'
 ```
 
 ### Measurements & Fields & Tags:
@@ -69,7 +100,7 @@ go_goroutines 15
 Example of output with configuration given above:
 
 ```
-$ ./telegraf -config telegraf.conf  -test
+$ ./telegraf --config telegraf.conf --test
 k8s_go_goroutines,kubeservice=kube-apiserver,url=http://my-kube-apiserver:8080/metrics gauge=536 1456857329391929813
 k8s_go_gc_duration_seconds,kubeservice=kube-apiserver,url=http://my-kube-apiserver:8080/metrics 0=0.038002142,0.25=0.041732467,0.5=0.04336492,0.75=0.047271799,1=0.058295811,count=0,sum=208.334617406 1456857329391929813
 ```
